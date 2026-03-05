@@ -533,8 +533,8 @@ namespace gamescope
 		{
 			std::optional<CDRMAtomicProperty> TYPE; // Immutable
 			std::optional<CDRMAtomicProperty> NEXT; // Immutable
-			std::optional<CDRMAtomicProperty> BYPASS; // Immutable
-
+			std::optional<CDRMAtomicProperty> BYPASS;
+			std::optional<CDRMAtomicProperty> CURVE_1D_TYPE;
 			std::optional<CDRMAtomicProperty> DATA;
 			std::optional<CDRMAtomicProperty> MULTIPLIER;
 		};
@@ -591,6 +591,7 @@ extern std::string g_reshade_effect;
 
 bool drm_update_color_mgmt(struct drm_t *drm);
 bool drm_supports_color_mgmt(struct drm_t *drm);
+bool drm_supports_color_pipeline(struct drm_t *drm);
 bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn );
 
 struct drm_color_ctm2 {
@@ -1904,6 +1905,21 @@ static inline amdgpu_transfer_function colorspace_to_plane_degamma_tf(GamescopeA
 	}
 }
 
+static inline drm_colorop_curve_1d_type colorspace_to_drm_plane_degamma_curve(GamescopeAppTextureColorspace colorspace)
+{
+	switch ( colorspace )
+	{
+		default: // Linear in this sense is SRGB. Linear = sRGB image view doing automatic sRGB -> Linear which doesn't happen on DRM side.
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB:
+			return DRM_COLOROP_1D_CURVE_SRGB_EOTF;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU:
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB:
+			return DRM_COLOROP_1D_CURVE_GAMMA22_INV; // wrong
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ:
+			return DRM_COLOROP_1D_CURVE_PQ_125_EOTF;
+	}
+}
+
 static inline amdgpu_transfer_function colorspace_to_plane_shaper_tf(GamescopeAppTextureColorspace colorspace)
 {
 	switch ( colorspace )
@@ -1918,6 +1934,22 @@ static inline amdgpu_transfer_function colorspace_to_plane_shaper_tf(GamescopeAp
 			return AMDGPU_TRANSFER_FUNCTION_DEFAULT;
 	}
 }
+
+static inline drm_colorop_curve_1d_type colorspace_to_drm_plane_shaper_curve(GamescopeAppTextureColorspace colorspace)
+{
+	switch ( colorspace )
+	{
+		default: // Linear in this sense is SRGB. Linear = sRGB image view doing automatic sRGB -> Linear which doesn't happen on DRM side.
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB:
+			return DRM_COLOROP_1D_CURVE_SRGB_INV_EOTF;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ:
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB:
+			return DRM_COLOROP_1D_CURVE_PQ_125_INV_EOTF;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU:
+			return DRM_COLOROP_1D_CURVE_GAMMA22; // wrong
+	}
+}
+
 
 static inline amdgpu_transfer_function inverse_tf(amdgpu_transfer_function tf)
 {
@@ -1952,6 +1984,23 @@ static inline amdgpu_transfer_function inverse_tf(amdgpu_transfer_function tf)
 			return AMDGPU_TRANSFER_FUNCTION_GAMMA24_EOTF;
 		case AMDGPU_TRANSFER_FUNCTION_GAMMA26_INV_EOTF:
 			return AMDGPU_TRANSFER_FUNCTION_GAMMA26_EOTF;
+	}
+}
+
+static inline drm_colorop_curve_1d_type amd_tf_to_drm_curve (amdgpu_transfer_function tf)
+{
+	switch ( tf )
+	{
+		case AMDGPU_TRANSFER_FUNCTION_SRGB_EOTF:
+			return DRM_COLOROP_1D_CURVE_SRGB_EOTF;
+		case AMDGPU_TRANSFER_FUNCTION_PQ_EOTF:
+			return DRM_COLOROP_1D_CURVE_PQ_125_EOTF;
+		case AMDGPU_TRANSFER_FUNCTION_SRGB_INV_EOTF:
+			return DRM_COLOROP_1D_CURVE_SRGB_INV_EOTF;
+		case AMDGPU_TRANSFER_FUNCTION_PQ_INV_EOTF:
+			return DRM_COLOROP_1D_CURVE_PQ_125_INV_EOTF;
+		default:
+			return DRM_COLOROP_1D_CURVE_GAMMA22_INV;
 	}
 }
 
@@ -2660,6 +2709,7 @@ namespace gamescope
 			m_Props.NEXT = CDRMAtomicProperty::Instantiate( "NEXT", this, *rawProperties );
 			m_Props.BYPASS = CDRMAtomicProperty::Instantiate( "BYPASS", this, *rawProperties );
 			m_Props.DATA = CDRMAtomicProperty::Instantiate( "DATA", this, *rawProperties );
+			m_Props.CURVE_1D_TYPE = CDRMAtomicProperty::Instantiate( "CURVE_1D_TYPE", this, *rawProperties );
 			m_Props.MULTIPLIER = CDRMAtomicProperty::Instantiate( "MULTIPLIER", this, *rawProperties );
 		}
 	}
@@ -2902,6 +2952,75 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 		}
 	}
 
+	if ( ret == 0 && drm_supports_color_pipeline( drm ) )
+	{
+		auto entry = FrameInfoToLiftoffStateCacheEntry( drm, frameInfo );
+		for ( int i = 0; i < frameInfo->layerCount; i++ )
+		{
+			if ( !frameInfo->layers[i].applyColorMgmt )
+				continue;
+
+			struct liftoff_plane *plane = liftoff_layer_get_plane( drm->lo_layers[ i ] );
+			uint32_t plane_id = plane ? liftoff_plane_get_id( plane ) : 0;
+
+			if ( plane_id == 0 )
+				continue;
+
+			for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+			{
+				if ( pPlane->GetObjectId() != plane_id )
+					continue;
+
+				bool bYCbCr = entry.layerState[i].ycbcr;
+				std::optional<gamescope::CDRMColorPipeline> p = get_plane_color_pipelines( drm, pPlane );
+				if ( !p ) {
+					drm_log.debugf( "drm_prepare_liftoff: No color pipeline fits layer %d", i );
+					break;
+				}
+
+				pPlane->GetProperties().COLOR_PIPELINE->SetPendingValue( drm->req, p->id, true );
+
+				drm_colorop_curve_1d_type degamma_tf = colorspace_to_drm_plane_degamma_curve( entry.layerState[i].colorspace );
+				drm_colorop_curve_1d_type shaper_tf = colorspace_to_drm_plane_shaper_curve( entry.layerState[i].colorspace );
+
+				if ( bYCbCr )
+				{
+					degamma_tf = DRM_COLOROP_1D_CURVE_BT2020_INV_OETF;
+					shaper_tf = DRM_COLOROP_1D_CURVE_BT2020_OETF;
+				}
+
+				p->degamma->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+				p->degamma->GetProperties().CURVE_1D_TYPE->SetPendingValue( drm->req, degamma_tf, true );
+
+				p->shaper->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+				p->shaper->GetProperties().CURVE_1D_TYPE->SetPendingValue( drm->req, shaper_tf, true );
+
+				p->shaperLut->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+//				p->shaperLut->GetProperties().DATA->SetPendingValue( drm->req, drm->pending.shaperlut_id[ ColorSpaceToEOTFIndex( entry.layerState[i].colorspace ) ]->GetBlobValue(), true );
+
+				p->lut3D->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+//				p->lut3D->GetProperties().DATA->SetPendingValue( drm->req, drm->pending.lut3d_id[ ColorSpaceToEOTFIndex( entry.layerState[i].colorspace ) ]->GetBlobValue(), true );
+
+				p->blend->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+				p->blend->GetProperties().CURVE_1D_TYPE->SetPendingValue( drm->req, amd_tf_to_drm_curve(drm->pending.output_tf), true );
+
+				p->blendLut->GetProperties().BYPASS->SetPendingValue( drm->req, 1, true );
+
+				if ( frameInfo->layers[i].ctm != nullptr ) {
+					p->CTM->GetProperties().BYPASS->SetPendingValue( drm->req, 0, true );
+					p->CTM->GetProperties().DATA->SetPendingValue( drm->req, frameInfo->layers[i].ctm->GetBlobValue(), true );
+				} else {
+					p->CTM->GetProperties().BYPASS->SetPendingValue( drm->req, 1, true );
+				}
+
+				p->HDRMult->GetProperties().BYPASS->SetPendingValue( drm->req, 1, true );
+				p->HDRMult->GetProperties().MULTIPLIER->SetPendingValue( drm->req, 0x100000000ULL, true );
+
+				break;
+			}
+		}
+	}
+
 	if ( ret == 0 )
 	{
 		// We don't support partial composition yet
@@ -3014,7 +3133,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 	bool bSinglePlane = frameInfo->layerCount < 2 && cv_drm_single_plane_optimizations;
 
-	if ( drm_supports_color_mgmt( &g_DRM ) && frameInfo->applyOutputColorMgmt )
+	if ( (drm_supports_color_mgmt( &g_DRM ) || drm_supports_color_pipeline( &g_DRM)) && frameInfo->applyOutputColorMgmt )
 	{
 		if ( !cv_drm_debug_disable_output_tf && !bSinglePlane )
 		{
@@ -3291,7 +3410,7 @@ gamescope::GamescopeScreenType drm_get_screen_type(struct drm_t *drm)
 
 bool drm_update_color_mgmt(struct drm_t *drm)
 {
-	if ( !drm_supports_color_mgmt( drm ) )
+	if ( !drm_supports_color_mgmt( drm ) && !drm_supports_color_pipeline ( &g_DRM ) )
 		return true;
 
 	if ( g_ColorMgmt.serial == drm->current.color_mgmt_serial )
@@ -4037,7 +4156,7 @@ namespace gamescope
 
 		bool SupportsColorManagement() const
 		{
-			return drm_supports_color_mgmt( &g_DRM );
+			return drm_supports_color_mgmt( &g_DRM ) || drm_supports_color_pipeline( &g_DRM );
 		}
 
 		int Commit( const FrameInfo_t *pFrameInfo )
