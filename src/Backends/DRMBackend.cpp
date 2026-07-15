@@ -1040,7 +1040,7 @@ static std::optional<gamescope::CDRMColorPipeline> get_crtc_colorop_pipeline( st
 }
 
 
-static std::optional<gamescope::CDRMColorPipeline> get_crtc_color_pipelines( struct drm_t *drm, std::unique_ptr< gamescope::CDRMCRTC > &pCRTC )
+static std::optional<gamescope::CDRMColorPipeline> get_crtc_color_pipelines( struct drm_t *drm, gamescope::CDRMCRTC *pCRTC )
 {
 	auto pColorPipelineProp = pCRTC->GetProperties().COLOR_PIPELINE;
 	if ( !pColorPipelineProp )
@@ -1113,7 +1113,7 @@ static bool get_resources(struct drm_t *drm)
 	{
 		for ( std::unique_ptr< gamescope::CDRMCRTC > &pCRTC : drm->crtcs )
 		{
-			if ( !get_crtc_color_pipelines( drm, pCRTC ) )
+			if ( !get_crtc_color_pipelines( drm, pCRTC.get() ) )
 				return false;
 		}
 	}
@@ -1687,6 +1687,9 @@ void finish_drm(struct drm_t *drm)
 
 		if ( pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF )
 			pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( req, 0, true );
+
+		if ( pCRTC->GetProperties().COLOR_PIPELINE )
+			pCRTC->GetProperties().COLOR_PIPELINE->SetPendingValue( req, 0, true );
 	}
 
 	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
@@ -3429,6 +3432,10 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 			if ( pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF )
 				pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, 0, bForceInRequest );
+
+			if ( pCRTC->GetProperties().COLOR_PIPELINE )
+				pCRTC->GetProperties().COLOR_PIPELINE->SetPendingValue( drm->req, 0, bForceInRequest );
+
 		}
 
 		if ( drm->pConnector && !bSleep )
@@ -3475,6 +3482,24 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 				drm->pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, inverse_tf( drm->pending.output_tf ), bForceInRequest );
 			else
 				drm->pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF->SetPendingValue( drm->req, AMDGPU_TRANSFER_FUNCTION_DEFAULT, bForceInRequest );
+		}
+
+		if ( drm_supports_color_pipeline( drm ) && drm->pCRTC->GetProperties().COLOR_PIPELINE )
+		{
+			std::optional<gamescope::CDRMColorPipeline> p = get_crtc_color_pipelines( drm, drm->pCRTC );
+			if ( !p ) {
+				drm_log.debugf( "No color pipeline fits color mgmt needs for CRTC");
+			} else {
+				drm->pCRTC->GetProperties().COLOR_PIPELINE->SetPendingValue( drm->req, p->id, bForceInRequest );
+				std::optional<drm_colorop_curve_1d_type> regamma_tf = amd_tf_to_drm_curve( inverse_tf( drm->pending.output_tf ) );
+				if ( !cv_drm_debug_disable_regamma_tf && regamma_tf.has_value() )
+				{
+					p->regamma->GetProperties().BYPASS->SetPendingValue( drm->req, 0, bForceInRequest );
+					p->regamma->GetProperties().CURVE_1D_TYPE->SetPendingValue( drm->req, *regamma_tf, bForceInRequest );
+				} else {
+					p->regamma->GetProperties().BYPASS->SetPendingValue( drm->req, 1, bForceInRequest );
+				}
+			}
 		}
 	}
 
